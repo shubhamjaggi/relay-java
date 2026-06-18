@@ -129,7 +129,6 @@ class RelayGroupTest {
         RuntimeException boom = new RuntimeException("boom");
 
         CountDownLatch leaderStarted = new CountDownLatch(1);
-        CountDownLatch followerReady = new CountDownLatch(1);
         List<Throwable> caught = Collections.synchronizedList(new ArrayList<>());
         CountDownLatch done = new CountDownLatch(2);
 
@@ -137,7 +136,7 @@ class RelayGroupTest {
             try {
                 group.execute("k", () -> {
                     leaderStarted.countDown();
-                    followerReady.await();
+                    Thread.sleep(50); // hold the key in-flight so follower has time to join
                     throw boom;
                 });
             } catch (Exception e) {
@@ -149,7 +148,7 @@ class RelayGroupTest {
 
         Thread follower = new Thread(() -> {
             try {
-                leaderStarted.await();
+                leaderStarted.await(); // wait until leader is in-flight, then join
                 group.execute("k", () -> { throw new AssertionError("follower should never run work"); });
             } catch (Exception e) {
                 caught.add(e);
@@ -160,7 +159,6 @@ class RelayGroupTest {
 
         leader.start();
         follower.start();
-        followerReady.countDown();
         assertTrue(done.await(5, TimeUnit.SECONDS));
 
         assertEquals(2, caught.size(), "Both leader and follower should have caught an exception");

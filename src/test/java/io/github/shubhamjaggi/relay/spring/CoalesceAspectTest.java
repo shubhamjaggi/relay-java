@@ -37,13 +37,24 @@ import static org.junit.jupiter.api.Assertions.*;
  *   <li>Exception type preservation — original exception type must reach the caller, not a wrapper</li>
  *   <li>Checked exception propagation — not just {@link RuntimeException}</li>
  *   <li>Coalescing triggered by the annotation, not by direct API calls</li>
+ *   <li>Self-call limitation — {@code this.method()} calls bypass the proxy and are not coalesced</li>
+ *   <li>Private method limitation — {@code @Coalesce} on private methods is silently ignored</li>
  * </ul>
+ *
+ * <h2>Counter access pattern</h2>
+ * <p>Each service inner class exposes {@code getCallCount()} and {@code resetCallCount()}
+ * rather than a public field. Spring injects CGLIB proxies for these beans; accessing a
+ * field directly on the proxy reaches the proxy's uninitialized field, not the real
+ * target's counter. Accessing through non-annotated public methods causes the proxy to
+ * delegate to the real target, where the counter is correctly maintained.
  */
 @ExtendWith(SpringExtension.class)
 @ContextConfiguration(classes = {
         CoalesceAspectTest.TestConfig.class,
         CoalesceAspectTest.ProfileService.class,
-        CoalesceAspectTest.CompositeKeyService.class
+        CoalesceAspectTest.CompositeKeyService.class,
+        CoalesceAspectTest.SelfCallingService.class,
+        CoalesceAspectTest.ServiceWithPrivateAnnotatedMethod.class
 })
 class CoalesceAspectTest {
 
@@ -82,7 +93,10 @@ class CoalesceAspectTest {
      */
     @Service
     static class ProfileService {
-        final AtomicInteger callCount = new AtomicInteger();
+        private final AtomicInteger callCount = new AtomicInteger();
+
+        public int getCallCount() { return callCount.get(); }
+        public void resetCallCount() { callCount.set(0); }
 
         @Coalesce(key = "#userId")
         public String getProfile(String userId) {
@@ -115,7 +129,10 @@ class CoalesceAspectTest {
      */
     @Service
     static class CompositeKeyService {
-        final AtomicInteger callCount = new AtomicInteger();
+        private final AtomicInteger callCount = new AtomicInteger();
+
+        public int getCallCount() { return callCount.get(); }
+        public void resetCallCount() { callCount.set(0); }
 
         @Coalesce(key = "#tenantId + ':' + #resourceId")
         public String fetchResource(String tenantId, String resourceId) throws InterruptedException {
@@ -125,13 +142,66 @@ class CoalesceAspectTest {
         }
     }
 
+    /**
+     * Service for the self-call limitation test. {@code fetchDirect} is annotated with
+     * {@link Coalesce} and is correctly coalesced when called through the injected
+     * Spring proxy. {@code fetchViaSelf} calls {@code fetchDirect} via {@code this.},
+     * bypassing the proxy — so {@link Coalesce} has no effect on that call path.
+     */
+    @Service
+    static class SelfCallingService {
+        private final AtomicInteger callCount = new AtomicInteger();
+
+        public int getCallCount() { return callCount.get(); }
+        public void resetCallCount() { callCount.set(0); }
+
+        @Coalesce(key = "#id")
+        public String fetchDirect(String id) throws InterruptedException {
+            callCount.incrementAndGet();
+            Thread.sleep(80);
+            return "result-" + id;
+        }
+
+        public String fetchViaSelf(String id) throws InterruptedException {
+            return this.fetchDirect(id); // this. bypasses the proxy; @Coalesce has no effect
+        }
+    }
+
+    /**
+     * Service for the private method limitation test. {@code fetchInternal} is private
+     * and annotated with {@link Coalesce}. Spring AOP cannot intercept private methods
+     * because CGLIB proxies cannot override them, so the annotation is silently ignored.
+     */
+    @Service
+    static class ServiceWithPrivateAnnotatedMethod {
+        private final AtomicInteger callCount = new AtomicInteger();
+
+        public int getCallCount() { return callCount.get(); }
+        public void resetCallCount() { callCount.set(0); }
+
+        public String fetch(String id) throws InterruptedException {
+            return fetchInternal(id);
+        }
+
+        @Coalesce(key = "#id")
+        private String fetchInternal(String id) throws InterruptedException {
+            callCount.incrementAndGet();
+            Thread.sleep(80);
+            return "result-" + id;
+        }
+    }
+
     @Autowired ProfileService profileService;
     @Autowired CompositeKeyService compositeKeyService;
+    @Autowired SelfCallingService selfCallingService;
+    @Autowired ServiceWithPrivateAnnotatedMethod privateMethodService;
 
     @BeforeEach
     void resetCounters() {
-        profileService.callCount.set(0);
-        compositeKeyService.callCount.set(0);
+        profileService.resetCallCount();
+        compositeKeyService.resetCallCount();
+        selfCallingService.resetCallCount();
+        privateMethodService.resetCallCount();
     }
 
     // ── Basic correctness ──────────────────────────────────────────────────────
@@ -145,7 +215,7 @@ class CoalesceAspectTest {
     void differentKeys_eachExecuteOnce() throws Exception {
         profileService.getProfile("A");
         profileService.getProfile("B");
-        assertEquals(2, profileService.callCount.get());
+        assertEquals(2, profileService.getCallCount());
     }
 
     @Test
@@ -153,7 +223,7 @@ class CoalesceAspectTest {
         // No in-flight overlap — each call completes before the next starts.
         profileService.getProfile("X");
         profileService.getProfile("X");
-        assertEquals(2, profileService.callCount.get());
+        assertEquals(2, profileService.getCallCount());
     }
 
     // ── Concurrent coalescing ──────────────────────────────────────────────────
@@ -197,9 +267,9 @@ class CoalesceAspectTest {
         assertEquals(threads, results.size(), "All callers should get a result");
         assertTrue(results.stream().allMatch(r -> r.equals("slow-profile-user-1")),
                 "All callers should receive the same result");
-        assertTrue(profileService.callCount.get() <= 3,
+        assertTrue(profileService.getCallCount() <= 3,
                 "Expected ≤3 actual method executions for " + threads + " concurrent callers, got: "
-                        + profileService.callCount.get());
+                        + profileService.getCallCount());
     }
 
     // ── Composite SpEL keys ────────────────────────────────────────────────────
@@ -239,7 +309,7 @@ class CoalesceAspectTest {
 
         assertEquals(threads, results.size());
         assertTrue(results.stream().allMatch(r -> r.equals("acme/report-1")));
-        assertTrue(compositeKeyService.callCount.get() <= 3,
+        assertTrue(compositeKeyService.getCallCount() <= 3,
                 "Expected ≤3 executions for " + threads + " concurrent callers on composite key");
     }
 
@@ -248,7 +318,7 @@ class CoalesceAspectTest {
         // acme:report-1 and acme:report-2 differ in resourceId — they must not coalesce.
         compositeKeyService.fetchResource("acme", "report-1");
         compositeKeyService.fetchResource("acme", "report-2");
-        assertEquals(2, compositeKeyService.callCount.get());
+        assertEquals(2, compositeKeyService.getCallCount());
     }
 
     @Test
@@ -256,7 +326,7 @@ class CoalesceAspectTest {
         // acme:report-1 and beta:report-1 differ in tenantId — they must not coalesce.
         compositeKeyService.fetchResource("acme", "report-1");
         compositeKeyService.fetchResource("beta", "report-1");
-        assertEquals(2, compositeKeyService.callCount.get());
+        assertEquals(2, compositeKeyService.getCallCount());
     }
 
     // ── Exception propagation ──────────────────────────────────────────────────
@@ -293,13 +363,101 @@ class CoalesceAspectTest {
     @Test
     void coalesceKey_namespacedByMethod_noCollisionAcrossDistinctMethods() throws Exception {
         profileService.getProfile("shared-key");
-        assertEquals(1, profileService.callCount.get());
+        assertEquals(1, profileService.getCallCount());
 
+        profileService.resetCallCount();
         // getSlowProfile uses the same SpEL expression and same argument value,
         // but is a different method — it must not be suppressed.
-        profileService.callCount.set(0);
         profileService.getSlowProfile("shared-key");
-        assertEquals(1, profileService.callCount.get(),
+        assertEquals(1, profileService.getCallCount(),
                 "getSlowProfile should execute independently from getProfile");
+    }
+
+    // ── Limitation: self-calls bypass proxy ───────────────────────────────────
+
+    /**
+     * Verifies the documented limitation that calling an annotated method via {@code this.}
+     * from inside the same class bypasses the Spring proxy and therefore bypasses coalescing.
+     *
+     * <p>30 threads call {@code fetchViaSelf("key")} concurrently through the proxy.
+     * Inside, each call routes to {@code this.fetchDirect("key")}, which bypasses
+     * the proxy. All 30 executions of {@code fetchDirect} run independently — the
+     * {@link Coalesce} annotation has no effect on self-calls — resulting in exactly
+     * 30 invocations of the method body.
+     *
+     * <p>Contrast: 30 threads calling {@code fetchDirect("key")} directly through the
+     * injected proxy reference would coalesce to ≤3 executions.
+     */
+    @Test
+    void selfCall_bypasses_proxy_noCoalescing() throws InterruptedException {
+        int threads = 30;
+        CountDownLatch ready = new CountDownLatch(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+
+        for (int i = 0; i < threads; i++) {
+            Thread t = new Thread(() -> {
+                ready.countDown();
+                try {
+                    start.await();
+                    selfCallingService.fetchViaSelf("key"); // routes through this. — proxy bypassed
+                } catch (Exception e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+            t.setDaemon(true);
+            t.start();
+        }
+
+        ready.await();
+        start.countDown();
+        assertTrue(done.await(10, TimeUnit.SECONDS));
+
+        assertEquals(threads, selfCallingService.getCallCount(),
+                "Self-calls bypass the proxy: all " + threads + " concurrent calls should execute independently");
+    }
+
+    // ── Limitation: private methods are not intercepted ───────────────────────
+
+    /**
+     * Verifies the documented limitation that {@link Coalesce} on a private method
+     * is silently ignored. Spring AOP uses CGLIB to proxy beans, and CGLIB cannot
+     * override private methods, so the annotation pointcut never matches them.
+     *
+     * <p>30 threads call the public entry point {@code fetch("key")}, which delegates
+     * internally to the private annotated {@code fetchInternal("key")}. Because the
+     * proxy cannot intercept the private method, all 30 executions run independently.
+     */
+    @Test
+    void privateMethod_coalesceAnnotation_isIgnored() throws InterruptedException {
+        int threads = 30;
+        CountDownLatch ready = new CountDownLatch(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+
+        for (int i = 0; i < threads; i++) {
+            Thread t = new Thread(() -> {
+                ready.countDown();
+                try {
+                    start.await();
+                    privateMethodService.fetch("key"); // delegates to private fetchInternal
+                } catch (Exception e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+            t.setDaemon(true);
+            t.start();
+        }
+
+        ready.await();
+        start.countDown();
+        assertTrue(done.await(10, TimeUnit.SECONDS));
+
+        assertEquals(threads, privateMethodService.getCallCount(),
+                "@Coalesce on private methods is ignored: all " + threads + " calls should execute independently");
     }
 }
