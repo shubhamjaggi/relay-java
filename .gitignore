@@ -1,0 +1,17 @@
+# Build output
+target/
+
+# IDE
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+*.class
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Maven wrapper cache (downloaded on first run, not source)
+.mvn/wrapper/maven-wrapper.jar
