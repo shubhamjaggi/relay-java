@@ -25,6 +25,58 @@ To build without running tests:
 ./mvnw package -DskipTests
 ```
 
+## How it's tested
+
+### CI workflow
+
+Every push and pull request to `main` runs `.github/workflows/ci.yml`, which:
+
+1. Checks out the code and sets up Java 21
+2. Runs `./mvnw verify` — compiles, runs all tests, and generates a Jacoco coverage report
+3. Uploads test results as a workflow artifact
+4. Uploads coverage to Codecov
+
+The build fails if any test fails. There is no deployment step; this is a library.
+
+### Test classes and what they prove
+
+**`RelayGroupTest`** — the core `RelayGroup` contract
+
+| Test | Claim verified |
+|---|---|
+| `execute_singleCaller_returnsExpectedValue` | A single caller receives the correct return value |
+| `execute_sequentialCalls_runEachTime` | Sequential calls (no overlap) each run the work independently |
+| `execute_differentKeys_runIndependently` | Different keys never share an execution |
+| `execute_concurrentCallers_sameKeySuppressesDuplicates` | 50 concurrent callers for the same key produce ≤3 actual executions |
+| `execute_leaderFails_followersReceiveSameException` | When the leader throws, every follower receives the same exception |
+| `execute_afterFailure_nextCallStartsFresh` | After a failure, the next call starts a fresh execution — no poisoned state |
+| `inFlightCount_isZeroWhenIdle` | `inFlightCount()` returns 0 when nothing is running |
+| `inFlightCount_tracksActiveWork` | `inFlightCount()` reflects the number of keys currently in progress |
+| `executeAsync_concurrentCallers_sameKeySuppressesDuplicates` | Same coalescing guarantee for the non-blocking async path |
+| `executeAsync_sequentialCalls_runEachTime` | Sequential async calls each run independently |
+| `executeAsync_differentKeys_runIndependently` | Different keys run independently on the async path |
+| `executeAsync_leaderFails_followersReceiveException` | Async failure propagates to all followers' futures |
+| `executeAsync_supplierThrowsSynchronously_futureCompletesExceptionally` | A supplier that throws before returning a future causes the future to complete exceptionally |
+| `execute_nullReturnValue_isAllowed` | `null` is a valid return value; the group does not treat it as a missing entry |
+
+**`CoalesceAspectTest`** — Spring AOP wiring for `@Coalesce`
+
+| Test | Claim verified |
+|---|---|
+| Concurrent callers coalesced | 30 threads on the same `@Coalesce` method produce ≤3 actual executions |
+| SpEL key resolution | `key = "#id"` evaluates to the argument value and is used as the deduplication key |
+| Per-method namespace | Two different methods annotated with the same SpEL expression do not share a key |
+| `selfCall_bypasses_proxy_noCoalescing` | A call via `this.method()` bypasses the proxy; `@Coalesce` has no effect — 30 callers → 30 executions |
+| `privateMethod_coalesceAnnotation_isIgnored` | `@Coalesce` on a `private` method has no effect — 30 callers → 30 executions |
+
+**`CacheableCoalesceIntegrationTest`** — `@Cacheable` and `@Coalesce` together
+
+| Test | Claim verified |
+|---|---|
+| `coldCacheMiss_concurrentCallers_coalesceToFewExecutions` | On a cold cache miss, 30 concurrent callers are coalesced; all receive the correct result; the result is stored in the cache |
+| `warmCacheHit_subsequentCall_doesNotExecuteMethodBody` | After the first call populates the cache, a second call is served from the cache without executing the method body |
+| `warmCacheHit_differentKey_stillExecutesMethodBody` | A cache hit for one key does not affect a different key — the different key still runs the method body |
+
 ## Submitting a bug report
 
 Use the [Bug Report](.github/ISSUE_TEMPLATE/bug_report.yml) template. Please include:
